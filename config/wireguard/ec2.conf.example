@@ -1,5 +1,6 @@
 [Interface]
 Address = 10.77.0.1/32
+# Puerto UDP local reservado exclusivamente a este túnel (corte de ambos sentidos).
 ListenPort = 51820
 PrivateKey = <CLAVE_PRIVADA_EC2>
 

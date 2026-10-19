@@ -11,6 +11,7 @@ def generate(directory):
     base = 1_700_000_000_000
     phases = ["normal", "latency", "outage", "restored"]
     events = [{"event": "phase", "phase": p, "ts_ms": base + i * 30_000} for i, p in enumerate(phases)]
+    events[3].update(operation_started_ms=base + 89_990, operation_ended_ms=base + 90_000)
     events.append({"event": "end", "ts_ms": base + 120_000})
     points, probes = [], []
     for n in range(120):
@@ -26,7 +27,8 @@ def generate(directory):
         probes.append({"started_ms": start, "ended_ms": start + (5 if success else 400), "success": success})
     for name, rows in [("events.jsonl", events), ("k6.jsonl", points), ("probes.jsonl", probes)]:
         (directory / name).write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-    (directory / "run.json").write_text(json.dumps({"schema": 1, "completed": True, "synthetic": True}), encoding="utf-8")
+    (directory / "run.json").write_text(json.dumps({"schema": 2, "completed": True, "synthetic": True,
+                                                   "config": {"delay_ms": 100, "rate": 1, "probe_interval_s": 0.5}}), encoding="utf-8")
 
 
 if __name__ == "__main__":

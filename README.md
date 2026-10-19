@@ -6,6 +6,25 @@
 
 Esta PoC mantiene una API, una base de datos y un ritmo bajo de solicitudes. Compara cuatro etapas y produce dos gráficas y un cuadro. No incluye monitoreo permanente, alta disponibilidad ni despliegue automático de AWS. Las mediciones describen **este laboratorio**, su red, sus timeouts y su aplicación; no se generalizan automáticamente a otras arquitecturas híbridas.
 
+## Preparación rápida por máquina
+
+**En EC2:**
+
+- Preparar Ubuntu 24.04, acceso SSH por la red habitual y Security Group con UDP 51820 desde el entorno local; no abrir PostgreSQL ni la API a Internet.
+- Clonar el repositorio, instalar Python/dependencias, k6, WireGuard, iproute2, iptables/ip6tables e iputils-ping.
+- Configurar `wg-poc` con `10.77.0.1/32`, un único peer y **ListenPort 51820 reservado para este túnel**, sin otros servicios ni interfaces usando ese puerto UDP.
+- Completar `.env` con la contraseña del lector de PostgreSQL y ejecutar la API en localhost.
+- Activar `.venv`, ejecutar `sudo -v` y luego el orquestador. Éste verifica herramientas, permisos, ruta, peer, puerto, API, lectura real de PostgreSQL e ICMP antes de cargar.
+
+**En Linux local (o VM Ubuntu en Windows):**
+
+- Clonar el repositorio e instalar WireGuard y PostgreSQL 16.
+- Configurar `wg-poc` con `10.77.0.2/32`, endpoint público de EC2 y keepalive; intercambiar sólo claves públicas.
+- Configurar PostgreSQL para escuchar en la IP del túnel y aceptar únicamente al lector desde `10.77.0.1/32`; cargar los productos y establecer la contraseña.
+- Levantar primero WireGuard, luego PostgreSQL; comprobar ping hacia EC2 y los permisos del firewall local.
+
+Las instrucciones y comandos completos aparecen a continuación. La carga y todas las mediciones se ejecutan en EC2.
+
 ## Arquitectura y decisiones
 
 ```mermaid
@@ -207,11 +226,13 @@ python scripts/analyze.py results/demo-01
 
 El directorio debe ser nuevo para no sobrescribir crudos. Son unos **105 segundos** más preparación y cierre. k6 programa carga por la suma de las duraciones más 1 s de margen para las transiciones y termina naturalmente. La última etapa absorbe ese margen y los costos de las órdenes: dura aproximadamente lo solicitado; puede añadir hasta 5 s de cierre de consultas en curso. Los eventos delimitan las duraciones reales. Si las transiciones acortan la última etapa más de 2 s, se rechaza la corrida. Las duraciones aceptan 5..300 s por etapa, el retardo 1..500 ms y el ritmo 1..5 solicitudes/s. `sudo -v` habilita las órdenes privilegiadas; k6 y la API se ejecutan como usuario normal. Para corridas largas renovar la credencial sudo según la política del host; si expira, la corrida falla y exige limpiar con sudo. No ejecutar dos experimentos simultáneos.
 
+La salida indica cada etapa y su duración prevista, retardo y sentido, corte UDP, retiro del bloqueo, resultado de limpieza y comando de análisis. El preflight limpia alteraciones propias residuales y verifica `k6`, `ping`, `sudo` y, con permisos elevados, `wg`, `ip`, `tc`, `iptables` e `ip6tables`. Comprueba también topología y acceso al firewall. `/healthz` valida el proceso y `/products` debe devolver 10 productos: esa lectura real verifica PostgreSQL por el túnel, sin duplicarla con otra conexión psql. Una falla impide iniciar k6 y muestra la corrección sugerida. Si faltan privilegios o herramientas para retirar residuos de una corrida anterior, lo indica explícitamente: instalar/corregir y ejecutar `cleanup` con sudo.
+
 | Etapa | Operación exacta que ejecuta el orquestador en EC2 | Duración por defecto |
 |---|---|---:|
 | Normal | `sudo /usr/bin/python3 scripts/net.py cleanup`, preflight, inicio de k6 | 30 s |
 | Latencia añadida | `sudo /usr/bin/python3 scripts/net.py delay --ms 100` | 30 s |
-| VPN interrumpida | `sudo /usr/bin/python3 scripts/net.py clear-delay` y luego `sudo /usr/bin/python3 scripts/net.py block` | 15 s |
+| VPN interrumpida (UDP exterior) | `sudo /usr/bin/python3 scripts/net.py clear-delay` y luego `sudo /usr/bin/python3 scripts/net.py block` | 15 s |
 | VPN restablecida | `sudo /usr/bin/python3 scripts/net.py restore` | 30 s |
 | Final | Finalización de k6 y `sudo /usr/bin/python3 scripts/net.py cleanup` | — |
 
@@ -233,26 +254,32 @@ Esta comprobación no produce un experimento de cuatro etapas ni se procesa con 
 
 El script rechaza un qdisc ajeno en esa interfaz, guarda su propiedad en `/run/cloud-hybrid-vpn-poc` y retira sólo su qdisc. En caso de conflicto no reemplaza configuraciones existentes. Las reglas `tc` y de firewall no se hacen persistentes.
 
-`net.py block` primero quita el retardo y luego aplica `DROP` en EC2 al TCP de PostgreSQL de ese peer (ambos sentidos) y al ICMP echo de la comprobación. **Simula pérdida de conectividad de los flujos del experimento por el túnel**: no baja la interfaz, no bloquea el UDP exterior y no reinicia WireGuard. Los keepalives/handshakes pueden continuar. Por eso no debe presentarse como reinicio de VPN o medición de tiempo de handshake. SSH, otros destinos, la ruta por defecto y las reglas ajenas quedan fuera de los selectores.
+`net.py block` primero quita el retardo y luego aplica **DROP al transporte UDP exterior de WireGuard**, en entrada (puerto **destino local** 51820) y salida (puerto **origen local** 51820). Instala dos reglas IPv4 y dos IPv6, con comentario y coincidencias exclusivos del proyecto. Se valida que `wg-poc` tenga `10.77.0.1`, ruta /32 al peer, exactamente un peer con `AllowedIPs=10.77.0.2/32`, endpoint IP/puerto válido con ruta exterior y que ninguna otra interfaz WireGuard comparta el puerto local 51820. Ese puerto debe estar reservado al experimento, sin servicios UDP adicionales.
 
-`restore` retira únicamente las reglas DROP identificadas por comentario y coincidencia exacta, además de cualquier retardo propio residual. `cleanup` también realiza ambas limpiezas. Ambas operaciones son repetibles. La eliminación efectiva de varias reglas no es atómica; se registra la duración de la orden de restauración para hacer visible esa incertidumbre.
+Se filtra por el **puerto local dedicado**, no por la interfaz virtual ni por la IP/puerto remoto aprendido: así un cambio de mapeo NAT del peer no elude el bloqueo. La validación rechaza un peer sin endpoint aprendido; iniciar primero un ping desde Linux local. El corte afecta todo el tráfico del túnel, incluidos datos, keepalives e intercambios de handshake. La interfaz y las claves permanecen configuradas. SSH por TCP y la ruta por defecto no se modifican; SSH **a través del túnel** naturalmente dejaría de funcionar, por eso se administra EC2 por su red habitual.
+
+Retirar el bloqueo permite de nuevo el transporte; **no obliga a un handshake nuevo**. Las métricas de recuperación ICMP y de productos no miden ni afirman la duración de una negociación WireGuard. Si una inserción falla, se intenta retirar todas las reglas propias ya insertadas; si el proceso es interrumpido abruptamente, `cleanup` reconoce las reglas exactas sin depender de un archivo de estado del bloqueo. Ante un error de borrado intenta retirar las restantes y pide repetir la limpieza.
+
+`restore` elimina primero cualquier retardo propio residual y después retira únicamente las reglas DROP identificadas por comentario y coincidencia exacta. `cleanup` también realiza ambas limpiezas. Ambas operaciones son repetibles. El retiro de varias reglas no es atómico: se registran inicio y fin efectivo de ese retiro, además del inicio y fin del comando completo.
 
 ## Métricas, archivos y lectura de resultados
 
 `results/demo-01/` contiene:
 
 - `k6.jsonl`: salida JSON cruda de k6. `product_latency_ms` agrega una muestra por consulta, inicio y fin Unix en ms, HTTP status y éxito. La duración incluye conexión HTTP y recepción; es la observación del cliente, no sólo el tiempo SQL. Sólo HTTP 200 con un arreglo válido de 10 productos se considera éxito.
-- `events.jsonl`: etapas, retiro del retardo y fin, con timestamps UTC Unix en milisegundos y reloj monotónico. Los cambios se registran al finalizar exitosamente la orden de red; también se registra el inicio de ésta.
+- `events.jsonl`: etapas, retiro del retardo y fin, con timestamps UTC Unix en milisegundos y reloj monotónico. En la etapa restablecida, `ts_ms` (t0) y `operation_ended_ms` proceden del script privilegiado, inmediatamente después de la última eliminación de regla. `operation_started_ms` marca el inicio del retiro; `command_started_ms` y `command_finished_ms` delimitan el comando completo. Las demás etapas se marcan al finalizar su orden de red.
 - `probes.jsonl`: ICMP iniciado cada 500 ms, con timeout de 400 ms, inicio, fin y éxito. Bajo sobrecarga la cadencia puede degradarse; los tiempos reales quedan guardados.
 - `run.json`: configuración sin secretos, versión k6 y estado de ejecución. `k6.log`: salida operativa.
-- `report/summary.csv`, `summary.md`, `requests.csv`, `timeline.png`, `comparison.png`: productos del análisis.
+- `report/summary.csv`, `summary.md`, `requests.csv`, `recovery.json`, `timeline.png`, `comparison.png`: productos del análisis. El CSV conserva nombres de columna estables; Markdown usa títulos legibles. El informe y las figuras muestran retardo, sentido, ritmo, recuperaciones y resolución. `recovery.json` conserva el estado, el instante observado y su diferencia firmada respecto a t0.
 
-**t0** es el timestamp inmediatamente posterior a que termina exitosamente `net.py restore`. Las reglas se retiraron durante la ventana que comienza en `operation_started_ms`. Las métricas incluyen planificación del proceso y resolución del muestreo; no son tiempos internos de WireGuard:
+**t0** se toma dentro de `net.py` inmediatamente después de que termina la última orden de eliminación de regla. No se interpone limpieza de qdiscs, impresión, verificación posterior ni salida del proceso entre esa orden y la captura de t0. El kernel retiró esa última regla antes de que retornara `iptables`/`ip6tables`: queda la incertidumbre de ejecución y planificación del subproceso, no precisión de timestamp del kernel. `operation_started_ms` y `operation_ended_ms` delimitan el retiro completo; el orquestador conserva esa marca sin reemplazarla por la recepción de la salida. Las métricas no son tiempos internos de WireGuard:
 
-1. **Recuperación de conectividad:** primera comprobación ICMP exitosa que finaliza desde t0, menos t0. Resolución aproximada de 500 ms, más RTT y planificación del host (timeout por intento 400 ms).
-2. **Recuperación de aplicación:** primera consulta k6 a productos exitosa que finaliza desde t0, menos t0. Resolución de aproximadamente `1 / rate` segundos más la duración de la consulta. Puede ser una consulta iniciada antes de t0 y completada después. No se agrega un generador adicional de consultas.
+1. **Recuperación de conectividad:** primera comprobación ICMP exitosa desde el inicio del retiro. Si termina desde t0, se informa su finalización menos t0. Resolución aproximada de 500 ms, más RTT y planificación del host (timeout por intento 400 ms).
+2. **Recuperación de aplicación:** primera consulta k6 a productos exitosa desde el inicio del retiro. Si termina desde t0, se informa su finalización menos t0. Resolución de aproximadamente `1 / rate` segundos (**1 segundo por defecto**) más la duración de la consulta. Puede estar en curso al comenzar el retiro. No se agrega otro generador de consultas.
 
-La API y ping son independientes. Una recuperación menor que la resolución de muestreo no demuestra precisión submilisegundo. Para declarar recuperación debe haberse observado al menos una falla del mecanismo correspondiente durante el corte; sin evidencia del corte, o sin éxito antes del fin, se muestra **N/A**, no cero. La restauración no elimina retrasos naturales ni retransmisiones ya pendientes.
+**Éxitos durante la transición:** el transporte IPv4 puede recuperarse antes de eliminar la última regla IPv6, por ejemplo. Si la primera finalización exitosa cae entre el inicio del retiro y t0, se muestra **N/A — recuperación observada durante el retiro**, con cuántos milisegundos antes de t0 ocurrió. El instante y diferencia negativa quedan en `recovery.json`; no se reemplazan por un éxito posterior ni se convierten en cero. El cuadro, las gráficas y la consola explicitan ese caso. Se conserva también la posible solicitud o comprobación iniciada antes del retiro. Para corridas antiguas de esquema 1, se mantiene el t0 original de fin de comando y se utiliza su ventana registrada; no se inventa una marca más precisa.
+
+La API y ping son independientes. Una recuperación menor que la resolución de muestreo no demuestra precisión submilisegundo. Para declarar recuperación debe haberse observado al menos una falla del mecanismo correspondiente durante el corte y antes de comenzar el retiro; sin evidencia del corte, o sin éxito antes del fin, se muestra **N/A**, con su motivo. La restauración no elimina retrasos naturales ni retransmisiones ya pendientes. Al finalizar el análisis se imprimen ambas recuperaciones o sus explicaciones.
 
 Las solicitudes se asignan a la etapa de su **inicio**. Las que terminan en otra etapa quedan marcadas `crosses_phase` en `requests.csv`; pueden existir consultas en curso durante transiciones. El pequeño intervalo entre quitar retardo y completar el bloqueo todavía pertenece a la etapa anterior por esta convención. Las marcas crudas permiten inspeccionarlo. La media y p95 usan exclusivamente éxitos; timeouts, 503 y respuestas inválidas se cuentan como fallas y aparecen aparte en la serie temporal.
 

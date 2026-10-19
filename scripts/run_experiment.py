@@ -6,11 +6,13 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import threading
 import time
 from urllib.request import urlopen
+from urllib.error import URLError
 
 ROOT = Path(__file__).resolve().parents[1]
 PEER = "10.77.0.2"
@@ -26,7 +28,44 @@ def emit(file, **values):
 
 
 def net(action, *args):
-    subprocess.run(["sudo", "-n", "/usr/bin/python3", str(ROOT / "scripts/net.py"), action, *args], check=True)
+    result = subprocess.run(["sudo", "-n", "/usr/bin/python3", str(ROOT / "scripts/net.py"),
+                             action, "--json", *args], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"Falló net.py {action}; revise sudo -v")
+    return json.loads(result.stdout)
+
+
+def say(message):
+    print(message, flush=True)
+
+
+def check_api():
+    for endpoint in ("healthz", "products?limit=10"):
+        try:
+            with urlopen(f"http://127.0.0.1:8000/{endpoint}", timeout=4) as response:
+                body = json.load(response)
+                valid = body == {"status": "ok"} if endpoint == "healthz" else (
+                    isinstance(body, list) and len(body) == 10 and
+                    all(isinstance(p, dict) and isinstance(p.get("id"), int) for p in body))
+                if response.status != 200 or not valid:
+                    raise ValueError("Respuesta inesperada")
+        except (URLError, TimeoutError, ValueError) as error:
+            hint = ("inicie uvicorn en 127.0.0.1:8000" if endpoint == "healthz" else
+                    "revise PostgreSQL, HBA, contraseña .env y la ruta a 10.77.0.2:5432")
+            raise RuntimeError(f"Preflight /{endpoint}: {hint}. No se iniciará k6") from error
+
+
+def preflight(metadata):
+    missing = [name for name in ("k6", "ping") if not shutil.which(name)]
+    if missing:
+        raise RuntimeError(f"Faltan {', '.join(missing)}. Use bash scripts/install_k6.sh y apt-get install iputils-ping")
+    metadata["k6_version"] = subprocess.check_output(["k6", "version"], text=True).strip()
+    metadata["tunnel"] = net("check")
+    # /products consulta realmente PostgreSQL por la IP fija del túnel; no duplicar con psql.
+    check_api()
+    if not ping()["success"]:
+        raise RuntimeError("No responde ping a 10.77.0.2: revise WireGuard y reglas ICMP antes de ejecutar")
+    say("Preparación verificada: herramientas, permisos, túnel, API, PostgreSQL e ICMP.")
 
 
 def ping():
@@ -72,26 +111,26 @@ def main():
     process = None
     thread = None
     completed = False
-    metadata = {"schema": 1, "synthetic": False, "config": {
+    sudo_ready = False
+    metadata = {"schema": 2, "synthetic": False, "config": {
         **{key: value for key, value in vars(args).items() if key != "out"},
         "probe_interval_s": 0.5, "probe_timeout_s": 0.4, "http_timeout_s": 4,
+        "delay_direction": "EC2 → PostgreSQL; sólo egreso TCP 5432 por wg-poc",
+        "outage_mechanism": "DROP transporte UDP local 51820, entrada y salida, IPv4 e IPv6",
     }}
     try:
-        subprocess.run(["sudo", "-n", "true"], check=True)
-        metadata["k6_version"] = subprocess.check_output(["k6", "version"], text=True).strip()
+        say("Preparación: verificando permisos y retirando alteraciones propias residuales...")
+        if not shutil.which("sudo") or subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode:
+            raise RuntimeError("Se requiere sudo: ejecute sudo -v en esta terminal antes de iniciar")
+        sudo_ready = True
         net("cleanup")
-        net("status")
-        for endpoint in ("healthz", "products?limit=10"):
-            with urlopen(f"http://127.0.0.1:8000/{endpoint}", timeout=4) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"Preflight falló: {endpoint}")
-        if not ping()["success"]:
-            raise RuntimeError("Preflight: no hay respuesta ICMP de 10.77.0.2")
+        preflight(metadata)
         with (args.out / "events.jsonl").open("x", encoding="utf-8") as events, \
                 (args.out / "k6.log").open("x", encoding="utf-8") as log:
             thread = threading.Thread(target=probe_loop, args=(args.out / "probes.jsonl", stop, errors))
             thread.start()
             emit(events, event="phase", phase="normal", **stamp())
+            say(f"[1/4] Normal — {args.normal} s previstos, {args.rate} solicitud(es)/s.")
             # Un segundo de margen para las transiciones; k6 finaliza naturalmente.
             env = {**os.environ, "RATE": str(args.rate), "DURATION_S": str(sum(durations) + 1),
                    "K6_NO_USAGE_REPORT": "true"}
@@ -112,17 +151,25 @@ def main():
             before = stamp()
             net("delay", "--ms", str(args.delay_ms))
             emit(events, event="phase", phase="latency", operation_started_ms=before["ts_ms"], **stamp())
+            say(f"[2/4] Latencia — {args.latency} s previstos. +{args.delay_ms} ms sólo EC2 → PostgreSQL (TCP 5432).")
             hold(args.latency)
             before = stamp()
             net("clear-delay")
             emit(events, event="delay_removed", operation_started_ms=before["ts_ms"], **stamp())
+            say("Retardo retirado. Iniciando corte del transporte UDP de WireGuard...")
             before = stamp()
             net("block")
             emit(events, event="phase", phase="outage", operation_started_ms=before["ts_ms"], **stamp())
+            say(f"[3/4] Túnel interrumpido — {args.outage} s previstos. UDP 51820 bloqueado en ambos sentidos.")
             hold(args.outage)
             before = stamp()
-            net("restore")
-            emit(events, event="phase", phase="restored", operation_started_ms=before["ts_ms"], **stamp())
+            say("Retirando el bloqueo UDP; se conserva la interfaz WireGuard configurada...")
+            restored = net("restore")
+            if not restored["block_removed"]:
+                raise RuntimeError("El bloqueo desapareció antes de restore; repetir sin cambios externos")
+            emit(events, event="phase", phase="restored", command_started_ms=before["ts_ms"],
+                 command_finished_ms=stamp()["ts_ms"], **restored)
+            say(f"[4/4] Tráfico restablecido — unos {args.restored} s previstos. t0 registrado al retirar la última regla.")
             restored_start = time.monotonic()
             returncode = process.wait(timeout=args.restored + 10)
             emit(events, event="end", **stamp())
@@ -148,7 +195,12 @@ def main():
         if thread is not None:
             thread.join(timeout=2)
         try:
-            net("cleanup")
+            if sudo_ready:
+                say("Finalizando: limpieza de reglas UDP y retardo propios...")
+                net("cleanup")
+                say("Limpieza completada correctamente.")
+            else:
+                say("No se aplicaron cambios. Si había alteraciones previas: sudo python3 scripts/net.py cleanup")
         except Exception as error:
             completed = False
             metadata["cleanup_error"] = str(error)
@@ -157,9 +209,14 @@ def main():
         (args.out / "run.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     if not completed:
         raise RuntimeError("Ejecución incompleta; revisar run.json y limpiar la red")
-    print(f"Resultados crudos: {args.out}")
+    say(f"Experimento finalizado. Resultados crudos: {args.out}")
+    say(f"Para generar gráficas, cuadro y recuperaciones: python scripts/analyze.py {args.out}")
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit("SIGTERM recibido"))
-    main()
+    try:
+        main()
+    except (RuntimeError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        print(f"ERROR: {error or 'Interrumpido por el operador'}. Revise run.json si se creó la carpeta.", file=sys.stderr)
+        sys.exit(1)
