@@ -1,0 +1,5 @@
+# Ubuntu 24.04 / PostgreSQL 16: añadir al final de postgresql.conf.
+# Primero debe existir wg-poc con la dirección 10.77.0.2.
+listen_addresses = '127.0.0.1,10.77.0.2'
+port = 5432
+password_encryption = 'scram-sha-256'

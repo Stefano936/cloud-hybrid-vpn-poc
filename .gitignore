@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.key
+*.pem
+wg-poc.conf
+results/*
+!results/.gitkeep
+examples/synthetic/output/
+.DS_Store

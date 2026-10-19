@@ -1,0 +1,8 @@
+[Interface]
+Address = 10.77.0.1/32
+ListenPort = 51820
+PrivateKey = <CLAVE_PRIVADA_EC2>
+
+[Peer]
+PublicKey = <CLAVE_PUBLICA_LOCAL>
+AllowedIPs = 10.77.0.2/32

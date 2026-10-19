@@ -1,0 +1,7 @@
+# Instancia dedicada: reemplazar pg_hba.conf por estas reglas.
+# La administración local usa el usuario postgres del sistema operativo.
+local   all          postgres                         peer
+local   all          all                              reject
+host    hybrid_poc   poc_reader   10.77.0.1/32          scram-sha-256
+host    all          all          0.0.0.0/0            reject
+host    all          all          ::/0                 reject

@@ -1,0 +1,9 @@
+[Interface]
+Address = 10.77.0.2/32
+PrivateKey = <CLAVE_PRIVADA_LOCAL>
+
+[Peer]
+PublicKey = <CLAVE_PUBLICA_EC2>
+Endpoint = <IP_PUBLICA_EC2>:51820
+AllowedIPs = 10.77.0.1/32
+PersistentKeepalive = 25

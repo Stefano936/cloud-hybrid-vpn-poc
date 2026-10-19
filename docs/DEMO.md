@@ -1,0 +1,11 @@
+# Guion de grabación (4–5 minutos)
+
+Preparar primero las dos máquinas, probar el acceso, limpiar alteraciones y cerrar otras cargas. Grabar previamente; no depender de una demostración en vivo. No mostrar `.env`, claves privadas ni sesiones con secretos. Usar terminales con letra grande.
+
+1. **0:00–0:30 — Objetivo y arquitectura.** Mostrar el diagrama del README y nombrar integrantes. Explicar que k6 y FastAPI están en EC2, la base en Linux local y sólo ese enlace cruza WireGuard. Señalar las dos métricas de recuperación.
+2. **0:30–1:00 — Preparación visible.** Mostrar en local `SELECT count(*) FROM products;` como postgres. En EC2 mostrar `ip route get 10.77.0.2`, un ping, `/healthz` y `/products`. Explicar que no existe caché ni reintentos y que no se busca saturación.
+3. **1:00–2:50 — Experimento de 105 segundos.** Iniciar el comando del README con un directorio nuevo. En otra terminal mostrar `tail -f results/demo-01/events.jsonl` y la terminal de la API. Cada línea `OK` anuncia una alteración. Narrar las cuatro etapas: referencia, 100 ms en un sentido, retiro de latencia seguido de DROP, y restauración. Durante el corte hacer una sola consulta manual a `/healthz` para mostrar que sigue vivo; evitar consultas extra a productos porque cambiarían la carga. No afirmar que se reinicia WireGuard: sólo se bloquean los flujos del experimento dentro del túnel.
+4. **2:50–3:50 — Resultados reales.** Ejecutar `python scripts/analyze.py results/demo-01`. Mostrar `summary.md` y ambas imágenes. Puede copiarse el directorio a la computadora de grabación por scp. Diferenciar éxitos de errores y recuperación ICMP de recuperación de productos. Si una métrica es N/A, explicar la causa; no sustituirla con datos sintéticos.
+5. **3:50–4:30 — Estado final y conclusión.** Mostrar `net.py status`, ping y productos nuevamente. Interpretar lo observado sin prometer valores universales. Mencionar el muestreo cada 500 ms y cada 1 s, el costo de abrir conexión por consulta y el alcance del laboratorio.
+
+Si la corrida falla, guardar los crudos, limpiar, corregir y grabar otra corrida completa. No presentar las gráficas sintéticas como resultados experimentales. La conclusión debe escribirse después de medir: qué cambió, qué volvió a la referencia y qué límites tiene la observación.
